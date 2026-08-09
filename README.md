@@ -32,6 +32,14 @@ include every file the live site has (drafts kept elsewhere, generated
 assets, whatever) without wiping anything out. If you want deletions synced
 too, do that manually through the Nekoweb dashboard or the raw API.
 
+## Big files
+
+Nekoweb's normal `/files/create` and `/files/edit` cap out at 100MB. Files at
+or above that size automatically go through the big-upload flow instead
+(`/files/big/create` -> `/files/big/append` in ~90MB chunks ->
+`/files/big/move`), no extra flags needed.
+
 ## Requirements
 
 - `bash`, `curl`, `sha256sum` (all standard on Linux/most *nix)
+- `jq` (only used to parse the big-upload session id)
