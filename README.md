@@ -47,7 +47,22 @@ response headers. On a `429`, the script sleeps until the bucket resets
 docs) and then retries automatically, so a big directory sync just pauses
 and continues instead of dying partway through.
 
+## Error handling
+
+Every create/edit/big-upload call checks its HTTP status. A non-2xx response
+is logged and counted as a failure instead of being silently treated as
+success; the script keeps going and syncs the rest of the files, then exits
+`1` at the end if anything failed (exits `0` if everything succeeded), so
+it's safe to use as a CI/deploy gate. Network-level failures (no response at
+all) get a bounded number of retries with backoff before being counted as a
+failure; 429s are retried indefinitely since that's expected backpressure,
+not an error.
+
+Filenames are percent-encoded before being used in the live-fetch URL, so
+filenames with spaces or other special characters don't break the
+change-detection check.
+
 ## Requirements
 
 - `bash`, `curl`, `sha256sum` (all standard on Linux/most *nix)
-- `jq` (only used to parse the big-upload session id)
+- `jq` (used to parse the big-upload session id and to URL-encode paths)
