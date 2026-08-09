@@ -25,10 +25,28 @@ export NEKOWEB_API_KEY=your_api_key_here
 
 # pull the whole live site down into a local dir (creates it if missing)
 ./nekosync.sh pull yoursite.nekoweb.org ./path/to/site
+
+# or let it figure out the domain for you
+./nekosync.sh pull auto ./path/to/site
 ```
 
-- `site-domain` — your Nekoweb domain, no scheme, no trailing slash.
+- `site-domain` — your Nekoweb domain, no scheme, no trailing slash, or the
+  literal word `auto` to look it up via `/site/info_all`. Auto-detection
+  uses your only site if you have just one, or the one flagged `main` if you
+  have several; with multiple sites and no `main`, it fails and lists your
+  domains so you can pass one explicitly.
 - `local-dir` — local directory whose contents mirror the site root.
+
+### A note on multi-site accounts
+
+Some accounts' file API is rooted one level above the actual site content:
+`GET /files/readfolder?pathname=/` returns a folder literally named after
+your site's domain, and that folder's contents are what's actually served
+publicly. nekosync detects this automatically at startup (by checking for a
+folder matching your site domain at the account root) and adjusts every
+internal API path accordingly - the public URLs it fetches for
+change-detection and downloads are never affected, only the internal
+`pathname` sent to `create`/`edit`/`big/move`/`readfolder`.
 
 ## Why no delete
 

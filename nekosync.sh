@@ -7,9 +7,10 @@
 set -uo pipefail
 
 usage() {
-  echo "Usage: NEKOWEB_API_KEY=... $0 <push|pull> <site-domain> <local-dir>" >&2
+  echo "Usage: NEKOWEB_API_KEY=... $0 <push|pull> <site-domain|auto> <local-dir>" >&2
   echo "  push|pull:   push local changes up, or pull the live site down" >&2
-  echo "  site-domain: e.g. yoursite.nekoweb.org (no scheme, no trailing slash)" >&2
+  echo "  site-domain: e.g. yoursite.nekoweb.org (no scheme, no trailing slash)," >&2
+  echo "               or 'auto' to detect it via /site/info_all" >&2
   echo "  local-dir:   directory whose contents mirror the site root" >&2
   exit 1
 }
@@ -45,6 +46,13 @@ MAX_TRANSIENT_RETRIES=5
 EXCLUDE_DIR_NAME=".___nekosync___not_synced___"
 
 FAILURES=0
+
+# Some accounts' file API is rooted above the actual site content - a
+# GET /files/readfolder?pathname=/ returns a folder literally named after
+# the site domain, and *that* folder's contents are what's actually served
+# publicly. Detected once at startup and prepended to every API pathname
+# below; the public live-fetch/download URLs never include this prefix.
+ROOT_PREFIX=""
 
 if [ "$MODE" = "push" ]; then
   [ -d "$LOCAL_DIR" ] || { echo "no such directory: $LOCAL_DIR" >&2; exit 1; }
@@ -137,6 +145,54 @@ api_call() {
   esac
 }
 
+# Checks whether GET /files/readfolder?pathname=/ contains a directory
+# entry named exactly $SITE_DOMAIN, and if so sets ROOT_PREFIX to it. Run
+# once before push or pull touches any real files.
+detect_root_prefix() {
+  if ! api_call GET "${API_BASE}/files/readfolder" -G --data-urlencode "pathname=/"; then
+    rm -f "${LAST_BODY_FILE:-}"
+    echo "warn:   could not list account root to check for a site-domain wrapper folder, assuming none" >&2
+    return
+  fi
+  if jq -e --arg d "$SITE_DOMAIN" '.[] | select(.dir == true and .name == $d)' "$LAST_BODY_FILE" > /dev/null 2>&1; then
+    ROOT_PREFIX="/${SITE_DOMAIN}"
+    echo "note:   account root has a /${SITE_DOMAIN} folder, treating that as the actual site root" >&2
+  fi
+  rm -f "$LAST_BODY_FILE"
+}
+
+# Resolves SITE_DOMAIN via GET /site/info_all when the domain arg is "auto".
+# Uses the single site if the account only has one, otherwise the one
+# flagged "main"; if neither applies, fails and lists the available domains
+# so the caller can pass one explicitly instead of "auto".
+detect_site_domain() {
+  if ! api_call GET "${API_BASE}/site/info_all"; then
+    rm -f "${LAST_BODY_FILE:-}"
+    echo "error:  could not auto-detect site domain via /site/info_all" >&2
+    exit 1
+  fi
+
+  local count main_domain
+  count=$(jq 'length' "$LAST_BODY_FILE")
+
+  if [ "$count" -eq 1 ]; then
+    SITE_DOMAIN=$(jq -r '.[0].domain' "$LAST_BODY_FILE")
+  else
+    main_domain=$(jq -r '[.[] | select(.main == true)][0].domain // empty' "$LAST_BODY_FILE")
+    if [ -n "$main_domain" ]; then
+      SITE_DOMAIN="$main_domain"
+    else
+      echo "error:  account has multiple sites and none is marked main - pass the domain explicitly instead of 'auto'. available:" >&2
+      jq -r '.[].domain' "$LAST_BODY_FILE" | sed 's/^/  /' >&2
+      rm -f "$LAST_BODY_FILE"
+      exit 1
+    fi
+  fi
+
+  rm -f "$LAST_BODY_FILE"
+  echo "note:   auto-detected site domain: ${SITE_DOMAIN}" >&2
+}
+
 # ---- push ----
 
 upload_big() {
@@ -173,7 +229,7 @@ upload_big() {
 
   if ! api_call POST "${API_BASE}/files/big/move" \
     --data-urlencode "id=${id}" \
-    --data-urlencode "pathname=/${rel}"; then
+    --data-urlencode "pathname=${ROOT_PREFIX}/${rel}"; then
     rm -f "$LAST_BODY_FILE"
     return 1
   fi
@@ -205,7 +261,7 @@ sync_file() {
       upload_big "$f" "$rel" || result=1
     else
       echo "create: $rel"
-      api_call POST "${API_BASE}/files/create" -F "pathname=/${rel}" -F "content=@${f}" || result=1
+      api_call POST "${API_BASE}/files/create" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=@${f}" || result=1
       rm -f "${LAST_BODY_FILE:-}"
     fi
   elif [ "$http_code" = "200" ]; then
@@ -218,7 +274,7 @@ sync_file() {
       upload_big "$f" "$rel" || result=1
     else
       echo "edit:   $rel"
-      api_call POST "${API_BASE}/files/edit" -F "pathname=/${rel}" -F "content=@${f}" || result=1
+      api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=@${f}" || result=1
       rm -f "${LAST_BODY_FILE:-}"
     fi
   else
@@ -241,19 +297,31 @@ run_push() {
 
 # ---- pull ----
 
+# Strips ROOT_PREFIX off an API-space path to get the path as it actually
+# appears in public URLs (which never include the wrapper folder).
+to_public_path() {
+  local p="$1"
+  if [ -n "$ROOT_PREFIX" ] && [ "${p#"$ROOT_PREFIX"}" != "$p" ]; then
+    p="${p#"$ROOT_PREFIX"}"
+    [ -n "$p" ] || p="/"
+  fi
+  echo "$p"
+}
+
 download_file() {
   local remote_path="$1" local_path="$2"
-  local encoded remote_url http_code
+  local public_path encoded remote_url http_code
 
-  encoded=$(url_encode_path "${remote_path#/}")
+  public_path=$(to_public_path "$remote_path")
+  encoded=$(url_encode_path "${public_path#/}")
   remote_url="https://${SITE_DOMAIN}/${encoded}"
   mkdir -p "$(dirname "$local_path")"
 
   http_code=$(curl -s -o "$local_path" -w '%{http_code}' "$remote_url") || http_code="000"
   if [ "$http_code" = "200" ]; then
-    echo "pull:   ${remote_path#/}"
+    echo "pull:   ${public_path#/}"
   else
-    echo "error:  ${remote_path#/} (HTTP ${http_code} fetching live copy)" >&2
+    echo "error:  ${public_path#/} (HTTP ${http_code} fetching live copy)" >&2
     rm -f "$local_path"
     FAILURES=$((FAILURES + 1))
   fi
@@ -291,8 +359,11 @@ pull_site() {
 }
 
 run_pull() {
-  pull_site "/" "$LOCAL_DIR"
+  pull_site "${ROOT_PREFIX:-/}" "$LOCAL_DIR"
 }
+
+[ "$SITE_DOMAIN" = "auto" ] && detect_site_domain
+detect_root_prefix
 
 if [ "$MODE" = "push" ]; then
   run_push
