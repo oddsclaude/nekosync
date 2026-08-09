@@ -32,27 +32,67 @@ hash_stdin() {
   sha256sum | cut -d' ' -f1
 }
 
+# Authenticated call to the Nekoweb API with rate-limit handling.
+# On a 429, reads the ratelimit-reset header (either an epoch timestamp or a
+# seconds-until-reset value depending on how far the bucket has been used)
+# and sleeps until the limit clears, then retries the same request.
+# Sets LAST_HTTP_CODE and LAST_BODY_FILE (caller is responsible for removing
+# LAST_BODY_FILE when done with it).
+api_call() {
+  local method="$1" url="$2"
+  shift 2
+  local headers_file body_file
+  headers_file=$(mktemp)
+  body_file=$(mktemp)
+
+  while true; do
+    LAST_HTTP_CODE=$(curl -s -D "$headers_file" -o "$body_file" -w '%{http_code}' \
+      -X "$method" -H "Authorization: ${NEKOWEB_API_KEY}" "$@" "$url")
+
+    if [ "$LAST_HTTP_CODE" = "429" ]; then
+      local reset now wait
+      reset=$(awk -F': ' 'tolower($1)=="ratelimit-reset"{print $2}' "$headers_file" | tr -d '\r\n')
+      now=$(date +%s)
+      if [[ "$reset" =~ ^[0-9]+$ ]] && [ "$reset" -gt "$now" ]; then
+        wait=$((reset - now))
+      elif [[ "$reset" =~ ^[0-9]+$ ]] && [ "$reset" -gt 0 ]; then
+        wait="$reset"
+      else
+        wait=5
+      fi
+      echo "rate limited (${url}), waiting ${wait}s for the bucket to reset..." >&2
+      sleep "$wait"
+      continue
+    fi
+    break
+  done
+
+  rm -f "$headers_file"
+  LAST_BODY_FILE="$body_file"
+}
+
 upload_big() {
   local f="$1" rel="$2"
   local id chunk_dir
-  id=$(curl -s -H "Authorization: ${NEKOWEB_API_KEY}" "${API_BASE}/files/big/create" | jq -r .id)
+
+  api_call GET "${API_BASE}/files/big/create"
+  id=$(jq -r .id < "$LAST_BODY_FILE")
+  rm -f "$LAST_BODY_FILE"
   [ -n "$id" ] && [ "$id" != "null" ] || { echo "warn:   $rel (failed to start big upload session)" >&2; return; }
 
   chunk_dir=$(mktemp -d)
   split -b "$CHUNK_SIZE" -d -a 4 "$f" "${chunk_dir}/chunk_"
 
   for chunk in "${chunk_dir}"/chunk_*; do
-    curl -s -H "Authorization: ${NEKOWEB_API_KEY}" \
-      -F "id=${id}" \
-      -F "file=@${chunk}" \
-      "${API_BASE}/files/big/append" > /dev/null
+    api_call POST "${API_BASE}/files/big/append" -F "id=${id}" -F "file=@${chunk}"
+    rm -f "$LAST_BODY_FILE"
   done
   rm -rf "$chunk_dir"
 
-  curl -s -H "Authorization: ${NEKOWEB_API_KEY}" \
+  api_call POST "${API_BASE}/files/big/move" \
     --data-urlencode "id=${id}" \
-    --data-urlencode "pathname=/${rel}" \
-    "${API_BASE}/files/big/move" > /dev/null
+    --data-urlencode "pathname=/${rel}"
+  rm -f "$LAST_BODY_FILE"
 }
 
 sync_file() {
@@ -63,6 +103,8 @@ sync_file() {
   local_hash=$(hash_stdin < "$f")
   filesize=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
 
+  # This is a plain fetch of the live site, not an authenticated API call,
+  # so it isn't subject to the /files/* rate-limit buckets.
   local http_code body_file
   body_file=$(mktemp)
   http_code=$(curl -s -o "$body_file" -w '%{http_code}' "$remote_url") || http_code="000"
@@ -73,10 +115,8 @@ sync_file() {
       upload_big "$f" "$rel"
     else
       echo "create: $rel"
-      curl -s -H "Authorization: ${NEKOWEB_API_KEY}" \
-        -F "pathname=/${rel}" \
-        -F "content=@${f}" \
-        "${API_BASE}/files/create" > /dev/null
+      api_call POST "${API_BASE}/files/create" -F "pathname=/${rel}" -F "content=@${f}"
+      rm -f "$LAST_BODY_FILE"
     fi
   elif [ "$http_code" = "200" ]; then
     local remote_hash
@@ -88,10 +128,8 @@ sync_file() {
       upload_big "$f" "$rel"
     else
       echo "edit:   $rel"
-      curl -s -H "Authorization: ${NEKOWEB_API_KEY}" \
-        -F "pathname=/${rel}" \
-        -F "content=@${f}" \
-        "${API_BASE}/files/edit" > /dev/null
+      api_call POST "${API_BASE}/files/edit" -F "pathname=/${rel}" -F "content=@${f}"
+      rm -f "$LAST_BODY_FILE"
     fi
   else
     echo "warn:   $rel (unexpected HTTP $http_code, skipping)" >&2

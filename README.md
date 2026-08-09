@@ -39,6 +39,14 @@ or above that size automatically go through the big-upload flow instead
 (`/files/big/create` -> `/files/big/append` in ~90MB chunks ->
 `/files/big/move`), no extra flags needed.
 
+## Rate limits
+
+Every authenticated call reads the `ratelimit-remaining`/`ratelimit-reset`
+response headers. On a `429`, the script sleeps until the bucket resets
+(general, big_uploads, and zip buckets are limited separately per Nekoweb's
+docs) and then retries automatically, so a big directory sync just pauses
+and continues instead of dying partway through.
+
 ## Requirements
 
 - `bash`, `curl`, `sha256sum` (all standard on Linux/most *nix)
