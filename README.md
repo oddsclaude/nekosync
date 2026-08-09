@@ -95,6 +95,10 @@ error.
 Filenames are percent-encoded before being used in any live-fetch URL, so
 filenames with spaces or other special characters don't break things.
 
+Live-fetch requests follow redirects, since Nekoweb 302s requests for
+`.html` files to their extensionless pretty-URL form (e.g. `about.html` ->
+`/about`).
+
 ## Requirements
 
 - `bash`, `curl`, `sha256sum` (all standard on Linux/most *nix)

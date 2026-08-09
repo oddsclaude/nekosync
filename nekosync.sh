@@ -249,10 +249,12 @@ sync_file() {
   filesize=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
 
   # This is a plain fetch of the live site, not an authenticated API call,
-  # so it isn't subject to the /files/* rate-limit buckets.
+  # so it isn't subject to the /files/* rate-limit buckets. -L follows
+  # redirects since Nekoweb 302s .html requests to their extensionless
+  # pretty-URL form (e.g. whyipirate.html -> /whyipirate).
   local http_code body_file
   body_file=$(mktemp)
-  http_code=$(curl -s -o "$body_file" -w '%{http_code}' "$remote_url") || http_code="000"
+  http_code=$(curl -sL -o "$body_file" -w '%{http_code}' "$remote_url") || http_code="000"
 
   local result=0
   if [ "$http_code" = "404" ]; then
@@ -317,7 +319,9 @@ download_file() {
   remote_url="https://${SITE_DOMAIN}/${encoded}"
   mkdir -p "$(dirname "$local_path")"
 
-  http_code=$(curl -s -o "$local_path" -w '%{http_code}' "$remote_url") || http_code="000"
+  # -L follows redirects since Nekoweb 302s .html requests to their
+  # extensionless pretty-URL form (e.g. whyipirate.html -> /whyipirate).
+  http_code=$(curl -sL -o "$local_path" -w '%{http_code}' "$remote_url") || http_code="000"
   if [ "$http_code" = "200" ]; then
     echo "pull:   ${public_path#/}"
   else
