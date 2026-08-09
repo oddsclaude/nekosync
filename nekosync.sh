@@ -263,7 +263,7 @@ sync_file() {
       upload_big "$f" "$rel" || result=1
     else
       echo "create: $rel"
-      api_call POST "${API_BASE}/files/create" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=@${f};type=application/octet-stream" || result=1
+      api_call POST "${API_BASE}/files/create" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || result=1
       rm -f "${LAST_BODY_FILE:-}"
     fi
   elif [ "$http_code" = "200" ]; then
@@ -276,7 +276,7 @@ sync_file() {
       upload_big "$f" "$rel" || result=1
     else
       echo "edit:   $rel"
-      api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=@${f};type=application/octet-stream" || result=1
+      api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || result=1
       rm -f "${LAST_BODY_FILE:-}"
     fi
   else
