@@ -1,27 +1,36 @@
 #!/bin/bash
-# nekosync - one-way sync of a local directory to a Nekoweb site.
-# Creates new files, edits changed files, skips unchanged files.
-# Never deletes anything remotely, even if a local file is missing.
+# nekosync - sync a local directory with a Nekoweb site.
+#   push: creates new files, edits changed files, skips unchanged files.
+#         never deletes anything remotely, even if a local file is missing.
+#   pull: downloads the entire live site into a local directory, to start
+#         editing locally.
 set -uo pipefail
 
 usage() {
-  echo "Usage: NEKOWEB_API_KEY=... $0 <site-domain> <local-dir>" >&2
+  echo "Usage: NEKOWEB_API_KEY=... $0 <push|pull> <site-domain> <local-dir>" >&2
+  echo "  push|pull:   push local changes up, or pull the live site down" >&2
   echo "  site-domain: e.g. yoursite.nekoweb.org (no scheme, no trailing slash)" >&2
   echo "  local-dir:   directory whose contents mirror the site root" >&2
   exit 1
 }
 
-[ $# -eq 2 ] || usage
+[ $# -eq 3 ] || usage
 : "${NEKOWEB_API_KEY:?NEKOWEB_API_KEY env var must be set}"
 
-SITE_DOMAIN="$1"
-LOCAL_DIR="${2%/}"
+MODE="$1"
+SITE_DOMAIN="$2"
+LOCAL_DIR="${3%/}"
 API_BASE="https://nekoweb.org/api"
+
+case "$MODE" in
+  push|pull) ;;
+  *) usage ;;
+esac
 
 # Nekoweb's normal /files/create and /files/edit cap out at 100MB. Anything
 # at or above that has to go through the big-upload flow (create session ->
 # append chunks -> move). Chunk size is kept comfortably under the 100MB
-# per-chunk limit.
+# per-chunk limit. Only relevant to push.
 BIG_THRESHOLD=$((100 * 1024 * 1024))
 CHUNK_SIZE=$((90 * 1024 * 1024))
 
@@ -31,13 +40,18 @@ CHUNK_SIZE=$((90 * 1024 * 1024))
 MAX_TRANSIENT_RETRIES=5
 
 # Any directory (at any depth) with this exact name is skipped entirely,
-# recursively - nothing under it is ever synced, checked, created, or edited.
+# recursively - nothing under it is ever synced, checked, created, edited,
+# or (on pull) downloaded.
 EXCLUDE_DIR_NAME=".___nekosync___not_synced___"
 
 FAILURES=0
 
-[ -d "$LOCAL_DIR" ] || { echo "no such directory: $LOCAL_DIR" >&2; exit 1; }
-command -v jq >/dev/null || { echo "jq is required (used to parse the big-upload session id and to URL-encode paths)" >&2; exit 1; }
+if [ "$MODE" = "push" ]; then
+  [ -d "$LOCAL_DIR" ] || { echo "no such directory: $LOCAL_DIR" >&2; exit 1; }
+else
+  mkdir -p "$LOCAL_DIR"
+fi
+command -v jq >/dev/null || { echo "jq is required (used to parse API responses and to URL-encode paths)" >&2; exit 1; }
 
 hash_stdin() {
   sha256sum | cut -d' ' -f1
@@ -66,7 +80,7 @@ url_encode_path() {
 # clears, then retries indefinitely. On a curl-level failure (no HTTP
 # response at all), retries a bounded number of times with a short backoff.
 # Sets LAST_HTTP_CODE and LAST_BODY_FILE (caller must rm LAST_BODY_FILE).
-# Returns non-zero if the call never got back a response after retries.
+# Returns non-zero if the call never got back a successful response.
 api_call() {
   local method="$1" url="$2"
   shift 2
@@ -122,6 +136,8 @@ api_call() {
       ;;
   esac
 }
+
+# ---- push ----
 
 upload_big() {
   local f="$1" rel="$2"
@@ -214,15 +230,78 @@ sync_file() {
   [ "$result" -eq 0 ] || FAILURES=$((FAILURES + 1))
 }
 
-# Read null-delimited to be robust against filenames with newlines/spaces.
-# -prune keeps find from ever descending into an excluded directory, so
-# nothing under it is touched, hashed, or fetched at all.
-while IFS= read -r -d '' f; do
-  sync_file "$f"
-done < <(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0)
+run_push() {
+  # Read null-delimited to be robust against filenames with newlines/spaces.
+  # -prune keeps find from ever descending into an excluded directory, so
+  # nothing under it is touched, hashed, or fetched at all.
+  while IFS= read -r -d '' f; do
+    sync_file "$f"
+  done < <(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0)
+}
+
+# ---- pull ----
+
+download_file() {
+  local remote_path="$1" local_path="$2"
+  local encoded remote_url http_code
+
+  encoded=$(url_encode_path "${remote_path#/}")
+  remote_url="https://${SITE_DOMAIN}/${encoded}"
+  mkdir -p "$(dirname "$local_path")"
+
+  http_code=$(curl -s -o "$local_path" -w '%{http_code}' "$remote_url") || http_code="000"
+  if [ "$http_code" = "200" ]; then
+    echo "pull:   ${remote_path#/}"
+  else
+    echo "error:  ${remote_path#/} (HTTP ${http_code} fetching live copy)" >&2
+    rm -f "$local_path"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+pull_site() {
+  local remote_pathname="$1" local_base="$2"
+
+  if ! api_call GET "${API_BASE}/files/readfolder" -G --data-urlencode "pathname=${remote_pathname}"; then
+    rm -f "${LAST_BODY_FILE:-}"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+  local entries="$LAST_BODY_FILE"
+
+  local name is_dir
+  while IFS=$'\t' read -r name is_dir; do
+    [ -n "$name" ] || continue
+    if [ "$is_dir" = "true" ] && [ "$name" = "$EXCLUDE_DIR_NAME" ]; then
+      continue
+    fi
+
+    local child_remote="${remote_pathname%/}/${name}"
+    local child_local="${local_base}/${name}"
+
+    if [ "$is_dir" = "true" ]; then
+      mkdir -p "$child_local"
+      pull_site "$child_remote" "$child_local"
+    else
+      download_file "$child_remote" "$child_local"
+    fi
+  done < <(jq -r '.[] | [.name, (.dir|tostring)] | @tsv' "$entries")
+
+  rm -f "$entries"
+}
+
+run_pull() {
+  pull_site "/" "$LOCAL_DIR"
+}
+
+if [ "$MODE" = "push" ]; then
+  run_push
+else
+  run_pull
+fi
 
 if [ "$FAILURES" -gt 0 ]; then
   echo "done with ${FAILURES} failure(s), see errors above" >&2
   exit 1
 fi
-echo "sync complete, no failures"
+echo "${MODE} complete, no failures"
