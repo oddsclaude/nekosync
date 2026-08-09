@@ -39,6 +39,13 @@ or above that size automatically go through the big-upload flow instead
 (`/files/big/create` -> `/files/big/append` in ~90MB chunks ->
 `/files/big/move`), no extra flags needed.
 
+## Excluding a folder
+
+Any directory named exactly `.___nekosync___not_synced___`, at any depth in
+your local dir, is skipped entirely and recursively - nothing under it gets
+hashed, checked, created, or edited. Useful for keeping drafts or
+work-in-progress files alongside your site source without them going live.
+
 ## Rate limits
 
 Every authenticated call reads the `ratelimit-remaining`/`ratelimit-reset`

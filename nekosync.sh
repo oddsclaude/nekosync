@@ -30,6 +30,10 @@ CHUNK_SIZE=$((90 * 1024 * 1024))
 # they're expected backpressure, not an error.
 MAX_TRANSIENT_RETRIES=5
 
+# Any directory (at any depth) with this exact name is skipped entirely,
+# recursively - nothing under it is ever synced, checked, created, or edited.
+EXCLUDE_DIR_NAME=".___nekosync___not_synced___"
+
 FAILURES=0
 
 [ -d "$LOCAL_DIR" ] || { echo "no such directory: $LOCAL_DIR" >&2; exit 1; }
@@ -62,7 +66,7 @@ url_encode_path() {
 # clears, then retries indefinitely. On a curl-level failure (no HTTP
 # response at all), retries a bounded number of times with a short backoff.
 # Sets LAST_HTTP_CODE and LAST_BODY_FILE (caller must rm LAST_BODY_FILE).
-# Returns non-zero if the call never got back a successful response.
+# Returns non-zero if the call never got back a response after retries.
 api_call() {
   local method="$1" url="$2"
   shift 2
@@ -211,9 +215,11 @@ sync_file() {
 }
 
 # Read null-delimited to be robust against filenames with newlines/spaces.
+# -prune keeps find from ever descending into an excluded directory, so
+# nothing under it is touched, hashed, or fetched at all.
 while IFS= read -r -d '' f; do
   sync_file "$f"
-done < <(find "$LOCAL_DIR" -type f -print0)
+done < <(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0)
 
 if [ "$FAILURES" -gt 0 ]; then
   echo "done with ${FAILURES} failure(s), see errors above" >&2
