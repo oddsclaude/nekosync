@@ -13,7 +13,7 @@ usage() {
   echo "               or 'auto' to detect it via /site/info_all" >&2
   echo "  local-dir:   directory whose contents mirror the site root" >&2
   echo "  -v/--verbose: print a permanent line per skipped file during the" >&2
-  echo "                check pass (push only); off by default" >&2
+  echo "                check pass (push only), instead of a progress bar" >&2
   exit 1
 }
 
@@ -57,10 +57,16 @@ EXCLUDE_DIR_NAME=".___nekosync___not_synced___"
 
 FAILURES=0
 
-# Check-pass progress: how many files have been checked so far, used only
-# for the [n/total] prefix on -v's permanent skip lines.
+# Check-pass progress: total file count (known up front) and how many have
+# been checked so far, driving the check-phase progress bar.
 TOTAL_FILES=0
 FILES_DONE=0
+PROGRESS_BAR_WIDTH=20
+
+# Whether an in-place progress line is currently sitting on the terminal
+# without a trailing newline. Any permanent line printed via log_line has
+# to close it first, or output gets mangled.
+PROGRESS_OPEN=0
 
 # Files the check pass decided need a create/edit, queued up so the action
 # pass can report an [n/total] count of *actual work*, not the full file
@@ -84,8 +90,28 @@ else
 fi
 command -v jq >/dev/null || { echo "jq is required (used to parse API responses and to URL-encode paths)" >&2; exit 1; }
 
+# Prints a permanent, newline-terminated status line, closing out any
+# in-progress bar line first so it doesn't get mangled.
 log_line() {
+  if [ "$PROGRESS_OPEN" -eq 1 ]; then
+    printf '\n'
+    PROGRESS_OPEN=0
+  fi
   echo "$1"
+}
+
+# Renders a green [=====-----] NN% (n/total) bar, overwriting the current
+# line in place, with an arbitrary trailing label (a filename, "checking...",
+# etc). Shared by the check pass and the action pass.
+render_bar() {
+  local done="$1" total="$2" label="$3"
+  local percent=$(( done * 100 / total ))
+  local filled=$(( percent * PROGRESS_BAR_WIDTH / 100 ))
+  local empty=$(( PROGRESS_BAR_WIDTH - filled ))
+  local bar
+  bar="$(printf '%*s' "$filled" '' | tr ' ' '=')$(printf '%*s' "$empty" '' | tr ' ' '-')"
+  printf '\r[\033[32m%s\033[0m] %d%% (%d/%d) %s\033[K' "$bar" "$percent" "$done" "$total" "$label"
+  PROGRESS_OPEN=1
 }
 
 hash_stdin() {
@@ -303,6 +329,7 @@ check_file() {
   remote_url="https://${SITE_DOMAIN}/${encoded_rel}"
 
   FILES_DONE=$((FILES_DONE + 1))
+  [ "$VERBOSE" -eq 0 ] && render_bar "$FILES_DONE" "$TOTAL_FILES" "checking..."
 
   local local_hash filesize
   local_hash=$(hash_stdin < "$f")
@@ -340,13 +367,12 @@ check_file() {
   rm -f "$body_file"
 }
 
-# Runs the queue built up by check_file, with an [n/total] counter where
+# Runs the queue built up by check_file, with its own [n/total] bar where
 # total is just the queued files - the ones that actually need a create or
-# edit, not the full file count from the check pass. This is the only
-# progress output shown by default.
+# edit, not the full file count from the check pass.
 apply_queue() {
   local total=${#QUEUE_ACTION[@]}
-  local i action f rel result n
+  local i action f rel result n label
   for ((i = 0; i < total; i++)); do
     action="${QUEUE_ACTION[$i]}"
     f="${QUEUE_LOCAL[$i]}"
@@ -355,27 +381,33 @@ apply_queue() {
     result=0
 
     case "$action" in
+      create)     label="create: $rel" ;;
+      create_big) label="create (big): $rel" ;;
+      edit)       label="edit:   $rel" ;;
+      edit_big)   label="edit (big):   $rel" ;;
+    esac
+    render_bar "$n" "$total" "$label"
+
+    case "$action" in
       create)
-        log_line "[$n/$total] create: $rel"
         create_and_fill "$f" "$rel" || result=1
         ;;
       create_big)
-        log_line "[$n/$total] create (big): $rel"
         upload_big "$f" "$rel" || result=1
         ;;
       edit)
-        log_line "[$n/$total] edit:   $rel"
         api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || result=1
         rm -f "${LAST_BODY_FILE:-}"
         ;;
       edit_big)
-        log_line "[$n/$total] edit (big):   $rel"
         upload_big "$f" "$rel" || result=1
         ;;
     esac
 
     [ "$result" -eq 0 ] || FAILURES=$((FAILURES + 1))
   done
+
+  [ "$PROGRESS_OPEN" -eq 1 ] && printf '\n'
 }
 
 run_push() {
@@ -387,6 +419,8 @@ run_push() {
   while IFS= read -r -d '' f; do
     check_file "$f"
   done < <(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0)
+
+  [ "$PROGRESS_OPEN" -eq 1 ] && printf '\n'
 
   apply_queue
 }
