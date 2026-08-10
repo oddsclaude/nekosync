@@ -13,7 +13,7 @@ usage() {
   echo "               or 'auto' to detect it via /site/info_all" >&2
   echo "  local-dir:   directory whose contents mirror the site root" >&2
   echo "  -v/--verbose: print a permanent line per skipped file (push only)," >&2
-  echo "                instead of overwriting a single progress line" >&2
+  echo "                instead of a live progress bar" >&2
   exit 1
 }
 
@@ -58,9 +58,11 @@ EXCLUDE_DIR_NAME=".___nekosync___not_synced___"
 FAILURES=0
 
 # Push progress: total file count (known up front) and how many have been
-# processed so far, shown as a [done/total] prefix on every status line.
+# processed so far, shown as a [done/total] prefix on every status line,
+# and driving the fill amount of the live skip-progress bar.
 TOTAL_FILES=0
 FILES_DONE=0
+PROGRESS_BAR_WIDTH=20
 
 # Whether an in-place progress line (from log_skip_progress) is currently
 # sitting on the terminal without a trailing newline. Any permanent line
@@ -91,10 +93,17 @@ log_line() {
   echo "$1"
 }
 
-# Overwrites a single line in place to show skip progress without printing
-# one line per unchanged file. Used unless -v/--verbose was passed.
+# Overwrites a single line in place with a green [=====-----] NN% (n/total)
+# bar to show skip progress without printing one line per unchanged file.
+# Used unless -v/--verbose was passed.
 log_skip_progress() {
-  printf '\r[%d/%d] skip: %s\033[K' "$FILES_DONE" "$TOTAL_FILES" "$1"
+  local percent=$(( FILES_DONE * 100 / TOTAL_FILES ))
+  local filled=$(( percent * PROGRESS_BAR_WIDTH / 100 ))
+  local empty=$(( PROGRESS_BAR_WIDTH - filled ))
+  local bar
+  bar="$(printf '%*s' "$filled" '' | tr ' ' '=')$(printf '%*s' "$empty" '' | tr ' ' '-')"
+  printf '\r[\033[32m%s\033[0m] %d%% (%d/%d) skip: %s\033[K' \
+    "$bar" "$percent" "$FILES_DONE" "$TOTAL_FILES" "$1"
   PROGRESS_OPEN=1
 }
 
