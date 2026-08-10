@@ -57,9 +57,8 @@ EXCLUDE_DIR_NAME=".___nekosync___not_synced___"
 
 FAILURES=0
 
-# Push progress: total file count (known up front) and how many have been
-# processed so far, shown as a [done/total] prefix on every status line,
-# and driving the fill amount of the live skip-progress bar.
+# Check-pass progress: total file count (known up front) and how many have
+# been checked so far, driving the [done/total] check-phase progress bar.
 TOTAL_FILES=0
 FILES_DONE=0
 PROGRESS_BAR_WIDTH=20
@@ -68,6 +67,14 @@ PROGRESS_BAR_WIDTH=20
 # sitting on the terminal without a trailing newline. Any permanent line
 # printed via log_line has to close it first, or output gets mangled.
 PROGRESS_OPEN=0
+
+# Files the check pass decided need a create/edit, queued up so the action
+# pass can report an [n/total] count of *actual work*, not the full file
+# count (most of which may just get skipped). Parallel arrays, one entry
+# per queued file.
+QUEUE_ACTION=()
+QUEUE_LOCAL=()
+QUEUE_REL=()
 
 # Some accounts' file API is rooted above the actual site content - a
 # GET /files/readfolder?pathname=/ returns a folder literally named after
@@ -94,8 +101,8 @@ log_line() {
 }
 
 # Overwrites a single line in place with a green [=====-----] NN% (n/total)
-# bar to show skip progress without printing one line per unchanged file.
-# Used unless -v/--verbose was passed.
+# bar to show check-pass progress without printing one line per unchanged
+# file. Used unless -v/--verbose was passed.
 log_skip_progress() {
   local percent=$(( FILES_DONE * 100 / TOTAL_FILES ))
   local filled=$(( percent * PROGRESS_BAR_WIDTH / 100 ))
@@ -304,7 +311,17 @@ create_and_fill() {
   return 0
 }
 
-sync_file() {
+queue_action() {
+  QUEUE_ACTION+=("$1")
+  QUEUE_LOCAL+=("$2")
+  QUEUE_REL+=("$3")
+}
+
+# One pass over every local file: fetches the live copy and hashes it to
+# decide skip/create/edit, exactly as before. The only difference is create
+# and edit no longer happen here - they're queued for the action pass, so
+# that pass can report a total that's just the real work.
+check_file() {
   local f="$1"
   local rel="${f#$LOCAL_DIR/}"
   local encoded_rel remote_url
@@ -312,7 +329,6 @@ sync_file() {
   remote_url="https://${SITE_DOMAIN}/${encoded_rel}"
 
   FILES_DONE=$((FILES_DONE + 1))
-  local prefix="[${FILES_DONE}/${TOTAL_FILES}]"
 
   local local_hash filesize
   local_hash=$(hash_stdin < "$f")
@@ -326,39 +342,69 @@ sync_file() {
   body_file=$(mktemp)
   http_code=$(curl -sL -o "$body_file" -w '%{http_code}' "$remote_url") || http_code="000"
 
-  local result=0
   if [ "$http_code" = "404" ]; then
     if [ "$filesize" -ge "$BIG_THRESHOLD" ]; then
-      log_line "$prefix create (big): $rel"
-      upload_big "$f" "$rel" || result=1
+      queue_action "create_big" "$f" "$rel"
     else
-      log_line "$prefix create: $rel"
-      create_and_fill "$f" "$rel" || result=1
+      queue_action "create" "$f" "$rel"
     fi
   elif [ "$http_code" = "200" ]; then
     local remote_hash
     remote_hash=$(hash_stdin < "$body_file")
     if [ "$local_hash" = "$remote_hash" ]; then
       if [ "$VERBOSE" -eq 1 ]; then
-        log_line "$prefix skip:   $rel"
+        log_line "[${FILES_DONE}/${TOTAL_FILES}] skip:   $rel"
       else
         log_skip_progress "$rel"
       fi
     elif [ "$filesize" -ge "$BIG_THRESHOLD" ]; then
-      log_line "$prefix edit (big):   $rel"
-      upload_big "$f" "$rel" || result=1
+      queue_action "edit_big" "$f" "$rel"
     else
-      log_line "$prefix edit:   $rel"
-      api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || result=1
-      rm -f "${LAST_BODY_FILE:-}"
+      queue_action "edit" "$f" "$rel"
     fi
   else
     log_line "warn:   $rel (unexpected HTTP $http_code fetching live copy, skipping)"
-    result=1
+    FAILURES=$((FAILURES + 1))
   fi
 
   rm -f "$body_file"
-  [ "$result" -eq 0 ] || FAILURES=$((FAILURES + 1))
+}
+
+# Runs the queue built up by check_file, with an [n/total] counter where
+# total is just the queued files - the ones that actually need a create or
+# edit, not the full file count from the check pass.
+apply_queue() {
+  local total=${#QUEUE_ACTION[@]}
+  local i action f rel result n
+  for ((i = 0; i < total; i++)); do
+    action="${QUEUE_ACTION[$i]}"
+    f="${QUEUE_LOCAL[$i]}"
+    rel="${QUEUE_REL[$i]}"
+    n=$((i + 1))
+    result=0
+
+    case "$action" in
+      create)
+        log_line "[$n/$total] create: $rel"
+        create_and_fill "$f" "$rel" || result=1
+        ;;
+      create_big)
+        log_line "[$n/$total] create (big): $rel"
+        upload_big "$f" "$rel" || result=1
+        ;;
+      edit)
+        log_line "[$n/$total] edit:   $rel"
+        api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || result=1
+        rm -f "${LAST_BODY_FILE:-}"
+        ;;
+      edit_big)
+        log_line "[$n/$total] edit (big):   $rel"
+        upload_big "$f" "$rel" || result=1
+        ;;
+    esac
+
+    [ "$result" -eq 0 ] || FAILURES=$((FAILURES + 1))
+  done
 }
 
 run_push() {
@@ -368,10 +414,12 @@ run_push() {
   TOTAL_FILES=$(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0 | tr -cd '\0' | wc -c)
 
   while IFS= read -r -d '' f; do
-    sync_file "$f"
+    check_file "$f"
   done < <(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0)
 
   [ "$PROGRESS_OPEN" -eq 1 ] && printf '\n'
+
+  apply_queue
 }
 
 # ---- pull ----
