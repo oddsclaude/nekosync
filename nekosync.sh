@@ -237,6 +237,23 @@ upload_big() {
   return 0
 }
 
+# Creates a brand-new remote file and populates it. /files/create only
+# stakes out the path (it needs isFolder and doesn't accept a body), so the
+# actual content always has to go through a follow-up /files/edit.
+create_and_fill() {
+  local f="$1" rel="$2"
+
+  if ! api_call POST "${API_BASE}/files/create" -F "isFolder=false" -F "pathname=${ROOT_PREFIX}/${rel}"; then
+    rm -f "${LAST_BODY_FILE:-}"
+    return 1
+  fi
+  rm -f "$LAST_BODY_FILE"
+
+  api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || { rm -f "${LAST_BODY_FILE:-}"; return 1; }
+  rm -f "$LAST_BODY_FILE"
+  return 0
+}
+
 sync_file() {
   local f="$1"
   local rel="${f#$LOCAL_DIR/}"
@@ -263,8 +280,7 @@ sync_file() {
       upload_big "$f" "$rel" || result=1
     else
       echo "create: $rel"
-      api_call POST "${API_BASE}/files/create" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || result=1
-      rm -f "${LAST_BODY_FILE:-}"
+      create_and_fill "$f" "$rel" || result=1
     fi
   elif [ "$http_code" = "200" ]; then
     local remote_hash
