@@ -238,12 +238,16 @@ upload_big() {
 }
 
 # Creates a brand-new remote file and populates it. /files/create only
-# stakes out the path (it needs isFolder and doesn't accept a body), so the
-# actual content always has to go through a follow-up /files/edit.
+# stakes out the path - it takes isFolder, no content, and (per the
+# reference client) a urlencoded body rather than multipart, unlike every
+# other endpoint here. The actual content always goes through a follow-up
+# /files/edit, which does use multipart.
 create_and_fill() {
   local f="$1" rel="$2"
 
-  if ! api_call POST "${API_BASE}/files/create" -F "isFolder=false" -F "pathname=${ROOT_PREFIX}/${rel}"; then
+  if ! api_call POST "${API_BASE}/files/create" \
+    --data-urlencode "isFolder=false" \
+    --data-urlencode "pathname=${ROOT_PREFIX}/${rel}"; then
     rm -f "${LAST_BODY_FILE:-}"
     return 1
   fi
