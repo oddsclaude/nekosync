@@ -13,7 +13,7 @@ usage() {
   echo "               or 'auto' to detect it via /site/info_all" >&2
   echo "  local-dir:   directory whose contents mirror the site root" >&2
   echo "  -v/--verbose: print a permanent line per skipped file (push only)," >&2
-  echo "                instead of a live progress bar" >&2
+  echo "                instead of a generic checking... progress bar" >&2
   exit 1
 }
 
@@ -63,7 +63,7 @@ TOTAL_FILES=0
 FILES_DONE=0
 PROGRESS_BAR_WIDTH=20
 
-# Whether an in-place progress line (from log_skip_progress) is currently
+# Whether an in-place progress line (from log_check_progress) is currently
 # sitting on the terminal without a trailing newline. Any permanent line
 # printed via log_line has to close it first, or output gets mangled.
 PROGRESS_OPEN=0
@@ -91,7 +91,7 @@ fi
 command -v jq >/dev/null || { echo "jq is required (used to parse API responses and to URL-encode paths)" >&2; exit 1; }
 
 # Prints a permanent, newline-terminated status line, closing out any
-# in-progress skip-counter line first so it doesn't get mangled.
+# in-progress checking-counter line first so it doesn't get mangled.
 log_line() {
   if [ "$PROGRESS_OPEN" -eq 1 ]; then
     printf '\n'
@@ -101,16 +101,18 @@ log_line() {
 }
 
 # Overwrites a single line in place with a green [=====-----] NN% (n/total)
-# bar to show check-pass progress without printing one line per unchanged
-# file. Used unless -v/--verbose was passed.
-log_skip_progress() {
+# checking... bar, so the check pass shows live progress without printing
+# one line per file. Used unless -v/--verbose was passed. No filename in
+# it - it advances for every file checked, not just skips, since in
+# non-verbose mode individual outcomes aren't reported here at all.
+log_check_progress() {
   local percent=$(( FILES_DONE * 100 / TOTAL_FILES ))
   local filled=$(( percent * PROGRESS_BAR_WIDTH / 100 ))
   local empty=$(( PROGRESS_BAR_WIDTH - filled ))
   local bar
   bar="$(printf '%*s' "$filled" '' | tr ' ' '=')$(printf '%*s' "$empty" '' | tr ' ' '-')"
-  printf '\r[\033[32m%s\033[0m] %d%% (%d/%d) skip: %s\033[K' \
-    "$bar" "$percent" "$FILES_DONE" "$TOTAL_FILES" "$1"
+  printf '\r[\033[32m%s\033[0m] %d%% (%d/%d) checking...\033[K' \
+    "$bar" "$percent" "$FILES_DONE" "$TOTAL_FILES"
   PROGRESS_OPEN=1
 }
 
@@ -329,6 +331,7 @@ check_file() {
   remote_url="https://${SITE_DOMAIN}/${encoded_rel}"
 
   FILES_DONE=$((FILES_DONE + 1))
+  [ "$VERBOSE" -eq 0 ] && log_check_progress
 
   local local_hash filesize
   local_hash=$(hash_stdin < "$f")
@@ -352,11 +355,7 @@ check_file() {
     local remote_hash
     remote_hash=$(hash_stdin < "$body_file")
     if [ "$local_hash" = "$remote_hash" ]; then
-      if [ "$VERBOSE" -eq 1 ]; then
-        log_line "[${FILES_DONE}/${TOTAL_FILES}] skip:   $rel"
-      else
-        log_skip_progress "$rel"
-      fi
+      [ "$VERBOSE" -eq 1 ] && log_line "[${FILES_DONE}/${TOTAL_FILES}] skip:   $rel"
     elif [ "$filesize" -ge "$BIG_THRESHOLD" ]; then
       queue_action "edit_big" "$f" "$rel"
     else
