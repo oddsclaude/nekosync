@@ -7,15 +7,25 @@
 set -uo pipefail
 
 usage() {
-  echo "Usage: NEKOWEB_API_KEY=... $0 <push|pull> <site-domain|auto> <local-dir>" >&2
+  echo "Usage: NEKOWEB_API_KEY=... $0 <push|pull> <site-domain|auto> <local-dir> [-v|--verbose]" >&2
   echo "  push|pull:   push local changes up, or pull the live site down" >&2
   echo "  site-domain: e.g. yoursite.nekoweb.org (no scheme, no trailing slash)," >&2
   echo "               or 'auto' to detect it via /site/info_all" >&2
   echo "  local-dir:   directory whose contents mirror the site root" >&2
+  echo "  -v/--verbose: print a permanent line per skipped file (push only)," >&2
+  echo "                instead of overwriting a single progress line" >&2
   exit 1
 }
 
-[ $# -eq 3 ] || usage
+VERBOSE=0
+if [ $# -eq 4 ]; then
+  case "$4" in
+    -v|--verbose) VERBOSE=1 ;;
+    *) usage ;;
+  esac
+elif [ $# -ne 3 ]; then
+  usage
+fi
 : "${NEKOWEB_API_KEY:?NEKOWEB_API_KEY env var must be set}"
 
 MODE="$1"
@@ -47,6 +57,16 @@ EXCLUDE_DIR_NAME=".___nekosync___not_synced___"
 
 FAILURES=0
 
+# Push progress: total file count (known up front) and how many have been
+# processed so far, shown as a [done/total] prefix on every status line.
+TOTAL_FILES=0
+FILES_DONE=0
+
+# Whether an in-place progress line (from log_skip_progress) is currently
+# sitting on the terminal without a trailing newline. Any permanent line
+# printed via log_line has to close it first, or output gets mangled.
+PROGRESS_OPEN=0
+
 # Some accounts' file API is rooted above the actual site content - a
 # GET /files/readfolder?pathname=/ returns a folder literally named after
 # the site domain, and *that* folder's contents are what's actually served
@@ -60,6 +80,23 @@ else
   mkdir -p "$LOCAL_DIR"
 fi
 command -v jq >/dev/null || { echo "jq is required (used to parse API responses and to URL-encode paths)" >&2; exit 1; }
+
+# Prints a permanent, newline-terminated status line, closing out any
+# in-progress skip-counter line first so it doesn't get mangled.
+log_line() {
+  if [ "$PROGRESS_OPEN" -eq 1 ]; then
+    printf '\n'
+    PROGRESS_OPEN=0
+  fi
+  echo "$1"
+}
+
+# Overwrites a single line in place to show skip progress without printing
+# one line per unchanged file. Used unless -v/--verbose was passed.
+log_skip_progress() {
+  printf '\r[%d/%d] skip: %s\033[K' "$FILES_DONE" "$TOTAL_FILES" "$1"
+  PROGRESS_OPEN=1
+}
 
 hash_stdin() {
   sha256sum | cut -d' ' -f1
@@ -105,10 +142,10 @@ api_call() {
       transient_tries=$((transient_tries + 1))
       rm -f "$headers_file" "$body_file"
       if [ "$transient_tries" -ge "$MAX_TRANSIENT_RETRIES" ]; then
-        echo "error:  ${url} unreachable after ${MAX_TRANSIENT_RETRIES} attempts, giving up" >&2
+        log_line "error:  ${url} unreachable after ${MAX_TRANSIENT_RETRIES} attempts, giving up"
         return 1
       fi
-      echo "warn:   ${url} unreachable, retrying (${transient_tries}/${MAX_TRANSIENT_RETRIES})..." >&2
+      log_line "warn:   ${url} unreachable, retrying (${transient_tries}/${MAX_TRANSIENT_RETRIES})..."
       sleep 3
       continue
     fi
@@ -124,7 +161,7 @@ api_call() {
       else
         wait=5
       fi
-      echo "rate limited (${url}), waiting ${wait}s for the bucket to reset..." >&2
+      log_line "rate limited (${url}), waiting ${wait}s for the bucket to reset..."
       rm -f "$headers_file" "$body_file"
       sleep "$wait"
       continue
@@ -139,7 +176,7 @@ api_call() {
   case "$LAST_HTTP_CODE" in
     2??) return 0 ;;
     *)
-      echo "error:  ${url} returned HTTP ${LAST_HTTP_CODE}: $(cat "$LAST_BODY_FILE" 2>/dev/null | head -c 300)" >&2
+      log_line "error:  ${url} returned HTTP ${LAST_HTTP_CODE}: $(cat "$LAST_BODY_FILE" 2>/dev/null | head -c 300)"
       return 1
       ;;
   esac
@@ -151,12 +188,12 @@ api_call() {
 detect_root_prefix() {
   if ! api_call GET "${API_BASE}/files/readfolder" -G --data-urlencode "pathname=/"; then
     rm -f "${LAST_BODY_FILE:-}"
-    echo "warn:   could not list account root to check for a site-domain wrapper folder, assuming none" >&2
+    log_line "warn:   could not list account root to check for a site-domain wrapper folder, assuming none"
     return
   fi
   if jq -e --arg d "$SITE_DOMAIN" '.[] | select(.dir == true and .name == $d)' "$LAST_BODY_FILE" > /dev/null 2>&1; then
     ROOT_PREFIX="/${SITE_DOMAIN}"
-    echo "note:   account root has a /${SITE_DOMAIN} folder, treating that as the actual site root" >&2
+    log_line "note:   account root has a /${SITE_DOMAIN} folder, treating that as the actual site root"
   fi
   rm -f "$LAST_BODY_FILE"
 }
@@ -206,7 +243,7 @@ upload_big() {
   id=$(jq -r .id < "$LAST_BODY_FILE")
   rm -f "$LAST_BODY_FILE"
   if [ -z "$id" ] || [ "$id" = "null" ]; then
-    echo "error:  $rel (big upload session had no id)" >&2
+    log_line "error:  $rel (big upload session had no id)"
     return 1
   fi
 
@@ -223,7 +260,7 @@ upload_big() {
   rm -rf "$chunk_dir"
 
   if [ "$ok" -eq 0 ]; then
-    echo "error:  $rel (a chunk failed to upload, not finalizing)" >&2
+    log_line "error:  $rel (a chunk failed to upload, not finalizing)"
     return 1
   fi
 
@@ -265,6 +302,9 @@ sync_file() {
   encoded_rel=$(url_encode_path "$rel")
   remote_url="https://${SITE_DOMAIN}/${encoded_rel}"
 
+  FILES_DONE=$((FILES_DONE + 1))
+  local prefix="[${FILES_DONE}/${TOTAL_FILES}]"
+
   local local_hash filesize
   local_hash=$(hash_stdin < "$f")
   filesize=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
@@ -280,27 +320,31 @@ sync_file() {
   local result=0
   if [ "$http_code" = "404" ]; then
     if [ "$filesize" -ge "$BIG_THRESHOLD" ]; then
-      echo "create (big): $rel"
+      log_line "$prefix create (big): $rel"
       upload_big "$f" "$rel" || result=1
     else
-      echo "create: $rel"
+      log_line "$prefix create: $rel"
       create_and_fill "$f" "$rel" || result=1
     fi
   elif [ "$http_code" = "200" ]; then
     local remote_hash
     remote_hash=$(hash_stdin < "$body_file")
     if [ "$local_hash" = "$remote_hash" ]; then
-      echo "skip:   $rel"
+      if [ "$VERBOSE" -eq 1 ]; then
+        log_line "$prefix skip:   $rel"
+      else
+        log_skip_progress "$rel"
+      fi
     elif [ "$filesize" -ge "$BIG_THRESHOLD" ]; then
-      echo "edit (big):   $rel"
+      log_line "$prefix edit (big):   $rel"
       upload_big "$f" "$rel" || result=1
     else
-      echo "edit:   $rel"
+      log_line "$prefix edit:   $rel"
       api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || result=1
       rm -f "${LAST_BODY_FILE:-}"
     fi
   else
-    echo "warn:   $rel (unexpected HTTP $http_code fetching live copy, skipping)" >&2
+    log_line "warn:   $rel (unexpected HTTP $http_code fetching live copy, skipping)"
     result=1
   fi
 
@@ -312,9 +356,13 @@ run_push() {
   # Read null-delimited to be robust against filenames with newlines/spaces.
   # -prune keeps find from ever descending into an excluded directory, so
   # nothing under it is touched, hashed, or fetched at all.
+  TOTAL_FILES=$(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0 | tr -cd '\0' | wc -c)
+
   while IFS= read -r -d '' f; do
     sync_file "$f"
   done < <(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0)
+
+  [ "$PROGRESS_OPEN" -eq 1 ] && printf '\n'
 }
 
 # ---- pull ----
