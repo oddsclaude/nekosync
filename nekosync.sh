@@ -12,8 +12,8 @@ usage() {
   echo "  site-domain: e.g. yoursite.nekoweb.org (no scheme, no trailing slash)," >&2
   echo "               or 'auto' to detect it via /site/info_all" >&2
   echo "  local-dir:   directory whose contents mirror the site root" >&2
-  echo "  -v/--verbose: print a permanent line per skipped file (push only)," >&2
-  echo "                instead of a generic checking... progress bar" >&2
+  echo "  -v/--verbose: print a permanent line per skipped file during the" >&2
+  echo "                check pass (push only); off by default" >&2
   exit 1
 }
 
@@ -57,16 +57,10 @@ EXCLUDE_DIR_NAME=".___nekosync___not_synced___"
 
 FAILURES=0
 
-# Check-pass progress: total file count (known up front) and how many have
-# been checked so far, driving the [done/total] check-phase progress bar.
+# Check-pass progress: how many files have been checked so far, used only
+# for the [n/total] prefix on -v's permanent skip lines.
 TOTAL_FILES=0
 FILES_DONE=0
-PROGRESS_BAR_WIDTH=20
-
-# Whether an in-place progress line (from log_check_progress) is currently
-# sitting on the terminal without a trailing newline. Any permanent line
-# printed via log_line has to close it first, or output gets mangled.
-PROGRESS_OPEN=0
 
 # Files the check pass decided need a create/edit, queued up so the action
 # pass can report an [n/total] count of *actual work*, not the full file
@@ -90,30 +84,8 @@ else
 fi
 command -v jq >/dev/null || { echo "jq is required (used to parse API responses and to URL-encode paths)" >&2; exit 1; }
 
-# Prints a permanent, newline-terminated status line, closing out any
-# in-progress checking-counter line first so it doesn't get mangled.
 log_line() {
-  if [ "$PROGRESS_OPEN" -eq 1 ]; then
-    printf '\n'
-    PROGRESS_OPEN=0
-  fi
   echo "$1"
-}
-
-# Overwrites a single line in place with a green [=====-----] NN% (n/total)
-# checking... bar, so the check pass shows live progress without printing
-# one line per file. Used unless -v/--verbose was passed. No filename in
-# it - it advances for every file checked, not just skips, since in
-# non-verbose mode individual outcomes aren't reported here at all.
-log_check_progress() {
-  local percent=$(( FILES_DONE * 100 / TOTAL_FILES ))
-  local filled=$(( percent * PROGRESS_BAR_WIDTH / 100 ))
-  local empty=$(( PROGRESS_BAR_WIDTH - filled ))
-  local bar
-  bar="$(printf '%*s' "$filled" '' | tr ' ' '=')$(printf '%*s' "$empty" '' | tr ' ' '-')"
-  printf '\r[\033[32m%s\033[0m] %d%% (%d/%d) checking...\033[K' \
-    "$bar" "$percent" "$FILES_DONE" "$TOTAL_FILES"
-  PROGRESS_OPEN=1
 }
 
 hash_stdin() {
@@ -331,7 +303,6 @@ check_file() {
   remote_url="https://${SITE_DOMAIN}/${encoded_rel}"
 
   FILES_DONE=$((FILES_DONE + 1))
-  [ "$VERBOSE" -eq 0 ] && log_check_progress
 
   local local_hash filesize
   local_hash=$(hash_stdin < "$f")
@@ -371,7 +342,8 @@ check_file() {
 
 # Runs the queue built up by check_file, with an [n/total] counter where
 # total is just the queued files - the ones that actually need a create or
-# edit, not the full file count from the check pass.
+# edit, not the full file count from the check pass. This is the only
+# progress output shown by default.
 apply_queue() {
   local total=${#QUEUE_ACTION[@]}
   local i action f rel result n
@@ -415,8 +387,6 @@ run_push() {
   while IFS= read -r -d '' f; do
     check_file "$f"
   done < <(find "$LOCAL_DIR" -type d -name "$EXCLUDE_DIR_NAME" -prune -o -type f -print0)
-
-  [ "$PROGRESS_OPEN" -eq 1 ] && printf '\n'
 
   apply_queue
 }
