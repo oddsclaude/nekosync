@@ -38,11 +38,15 @@ case "$MODE" in
   *) usage ;;
 esac
 
-# Nekoweb's normal /files/create and /files/edit cap out at 100MB. Anything
-# at or above that has to go through the big-upload flow (create session ->
-# append chunks -> move). Chunk size is kept comfortably under the 100MB
-# per-chunk limit. Only relevant to push.
-BIG_THRESHOLD=$((100 * 1024 * 1024))
+# Nekoweb's /files/edit sends "content" as a plain multipart string field,
+# not raw binary - it corrupts binary files (confirmed: PNGs get mangled,
+# byte count shrinks, consistent with invalid UTF-8 sequences being dropped
+# server-side). The big-upload flow (create session -> append chunks ->
+# move) transfers real binary chunks instead, so ALL files go through it now,
+# regardless of size - not just ones over some size threshold. This matches
+# what nekoweb's own deploy2nekoweb action does (it never touches
+# /files/edit for real content either, only the big-upload path). Chunk size
+# is kept comfortably under the 100MB per-chunk limit.
 CHUNK_SIZE=$((90 * 1024 * 1024))
 
 # How many times to retry a transient (network-level, non-HTTP) failure
@@ -290,27 +294,6 @@ upload_big() {
   return 0
 }
 
-# Creates a brand-new remote file and populates it. /files/create only
-# stakes out the path - it takes isFolder, no content, and (per the
-# reference client) a urlencoded body rather than multipart, unlike every
-# other endpoint here. The actual content always goes through a follow-up
-# /files/edit, which does use multipart.
-create_and_fill() {
-  local f="$1" rel="$2"
-
-  if ! api_call POST "${API_BASE}/files/create" \
-    --data-urlencode "isFolder=false" \
-    --data-urlencode "pathname=${ROOT_PREFIX}/${rel}"; then
-    rm -f "${LAST_BODY_FILE:-}"
-    return 1
-  fi
-  rm -f "$LAST_BODY_FILE"
-
-  api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || { rm -f "${LAST_BODY_FILE:-}"; return 1; }
-  rm -f "$LAST_BODY_FILE"
-  return 0
-}
-
 queue_action() {
   QUEUE_ACTION+=("$1")
   QUEUE_LOCAL+=("$2")
@@ -331,9 +314,8 @@ check_file() {
   FILES_DONE=$((FILES_DONE + 1))
   [ "$VERBOSE" -eq 0 ] && render_bar "$FILES_DONE" "$TOTAL_FILES" "checking..."
 
-  local local_hash filesize
+  local local_hash
   local_hash=$(hash_stdin < "$f")
-  filesize=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
 
   # This is a plain fetch of the live site, not an authenticated API call,
   # so it isn't subject to the /files/* rate-limit buckets. -L follows
@@ -344,20 +326,14 @@ check_file() {
   http_code=$(curl -sL -o "$body_file" -w '%{http_code}' "$remote_url") || http_code="000"
 
   if [ "$http_code" = "404" ]; then
-    if [ "$filesize" -ge "$BIG_THRESHOLD" ]; then
-      queue_action "create_big" "$f" "$rel"
-    else
-      queue_action "create" "$f" "$rel"
-    fi
+    queue_action "create_big" "$f" "$rel"
   elif [ "$http_code" = "200" ]; then
     local remote_hash
     remote_hash=$(hash_stdin < "$body_file")
     if [ "$local_hash" = "$remote_hash" ]; then
       [ "$VERBOSE" -eq 1 ] && log_line "[${FILES_DONE}/${TOTAL_FILES}] skip:   $rel"
-    elif [ "$filesize" -ge "$BIG_THRESHOLD" ]; then
-      queue_action "edit_big" "$f" "$rel"
     else
-      queue_action "edit" "$f" "$rel"
+      queue_action "edit_big" "$f" "$rel"
     fi
   else
     log_line "warn:   $rel (unexpected HTTP $http_code fetching live copy, skipping)"
@@ -381,25 +357,13 @@ apply_queue() {
     result=0
 
     case "$action" in
-      create)     label="create: $rel" ;;
-      create_big) label="create (big): $rel" ;;
-      edit)       label="edit:   $rel" ;;
-      edit_big)   label="edit (big):   $rel" ;;
+      create_big) label="create: $rel" ;;
+      edit_big)   label="edit:   $rel" ;;
     esac
     render_bar "$n" "$total" "$label"
 
     case "$action" in
-      create)
-        create_and_fill "$f" "$rel" || result=1
-        ;;
-      create_big)
-        upload_big "$f" "$rel" || result=1
-        ;;
-      edit)
-        api_call POST "${API_BASE}/files/edit" -F "pathname=${ROOT_PREFIX}/${rel}" -F "content=<${f}" || result=1
-        rm -f "${LAST_BODY_FILE:-}"
-        ;;
-      edit_big)
+      create_big|edit_big)
         upload_big "$f" "$rel" || result=1
         ;;
     esac
